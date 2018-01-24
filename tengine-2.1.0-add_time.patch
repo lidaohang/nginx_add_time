@@ -1,0 +1,437 @@
+diff -uNr tengine-2.1.0/src/http/modules/ngx_http_log_module.c tengine-2.1.0_news/src/http/modules/ngx_http_log_module.c
+--- tengine-2.1.0/src/http/modules/ngx_http_log_module.c	2018-01-02 11:36:11.417001642 +0800
++++ tengine-2.1.0_news/src/http/modules/ngx_http_log_module.c	2018-01-02 11:37:16.514001637 +0800
+@@ -151,6 +151,12 @@
+     u_char *buf, ngx_http_log_op_t *op);
+ static u_char *ngx_http_log_request_time_usec(ngx_http_request_t *r,
+     u_char *buf, ngx_http_log_op_t *op);
++static u_char *ngx_http_log_request_header_time(ngx_http_request_t *r,
++    u_char *buf, ngx_http_log_op_t *op);
++static u_char *ngx_http_log_request_body_time(ngx_http_request_t *r,
++    u_char *buf, ngx_http_log_op_t *op);
++static u_char *ngx_http_log_request_module_time(ngx_http_request_t *r,
++    u_char *buf, ngx_http_log_op_t *op);
+ static u_char *ngx_http_log_status(ngx_http_request_t *r, u_char *buf,
+     ngx_http_log_op_t *op);
+ static u_char *ngx_http_log_bytes_sent(ngx_http_request_t *r, u_char *buf,
+@@ -291,6 +297,12 @@
+                           ngx_http_log_request_time_msec },
+     { ngx_string("request_time_usec"), NGX_TIME_T_LEN,
+                           ngx_http_log_request_time_usec },
++    { ngx_string("request_header_time"), NGX_TIME_T_LEN,
++                          ngx_http_log_request_header_time },
++    { ngx_string("request_body_time"), NGX_TIME_T_LEN,
++                          ngx_http_log_request_body_time },
++    { ngx_string("request_module_time"), NGX_TIME_T_LEN,
++                          ngx_http_log_request_module_time },
+     { ngx_string("status"), NGX_INT_T_LEN, ngx_http_log_status },
+     { ngx_string("bytes_sent"), NGX_OFF_T_LEN, ngx_http_log_bytes_sent },
+     { ngx_string("body_bytes_sent"), NGX_OFF_T_LEN,
+@@ -970,6 +982,46 @@
+ 
+ 
+ static u_char *
++ngx_http_log_request_header_time(ngx_http_request_t *r, u_char *buf,
++    ngx_http_log_op_t *op)
++{
++    ngx_msec_int_t             ms;
++
++    ms = r->recv_header_msec;
++    ms = ngx_max(ms, 0);
++
++    return ngx_sprintf(buf, "%T.%03M", (time_t) ms / 1000, ms % 1000);
++}
++
++
++static u_char *
++ngx_http_log_request_body_time(ngx_http_request_t *r, u_char *buf,
++    ngx_http_log_op_t *op)
++{
++    ngx_msec_int_t             ms;
++
++    ms = r->recv_body_msec;
++    ms = ngx_max(ms, 0);
++
++    return ngx_sprintf(buf, "%T.%03M", (time_t) ms / 1000, ms % 1000);
++}
++
++
++static u_char *
++ngx_http_log_request_module_time(ngx_http_request_t *r, u_char *buf,
++    ngx_http_log_op_t *op)
++{
++    ngx_msec_int_t             ms;
++
++    ms = r->recv_module_msec - ngx_max(r->recv_header_msec, 0) - ngx_max(r->recv_body_msec, 0);
++    ms = ngx_max(ms, 0);
++
++
++    return ngx_sprintf(buf, "%T.%03M", (time_t) ms / 1000, ms % 1000);
++}
++
++
++static u_char *
+ ngx_http_log_status(ngx_http_request_t *r, u_char *buf, ngx_http_log_op_t *op)
+ {
+     ngx_uint_t  status;
+diff -uNr tengine-2.1.0/src/http/ngx_http_request_body.c tengine-2.1.0_news/src/http/ngx_http_request_body.c
+--- tengine-2.1.0/src/http/ngx_http_request_body.c	2018-01-02 11:36:11.432001642 +0800
++++ tengine-2.1.0_news/src/http/ngx_http_request_body.c	2018-01-02 11:37:09.580001645 +0800
+@@ -46,12 +46,23 @@
+     ssize_t                    size;
+     ngx_int_t                  rc;
+     ngx_buf_t                 *b;
++    struct timeval             tv;
++    ngx_time_t                *tp;
+     ngx_chain_t                out, *cl;
+     ngx_http_request_body_t   *rb;
+     ngx_http_core_loc_conf_t  *clcf;
++    ngx_msec_int_t             ms;
+ 
+     r->main->count++;
+ 
++    ngx_gettimeofday(&tv);
++    r->start_body_sec = tv.tv_sec;
++    r->start_body_msec = tv.tv_usec / 1000;
++    r->start_body_usec = tv.tv_usec % 1000;
++    r->recv_body_msec = (NGX_ERROR) -1;
++
++    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
++
+ #if (NGX_HTTP_SPDY)
+     if (r->spdy_stream && r == r->main) {
+         rc = ngx_http_spdy_read_request_body(r, post_handler);
+@@ -202,8 +213,6 @@
+         goto done;
+     }
+ 
+-    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+-
+     size = clcf->client_body_buffer_size;
+     size += size >> 2;
+ 
+@@ -233,6 +242,22 @@
+ 
+ done:
+ 
++    if (clcf->request_time_cache) {
++        tp = ngx_timeofday();
++        ms = (ngx_msec_int_t)
++                 ((tp->sec - r->start_body_sec) * 1000 + (tp->msec - r->start_body_msec));
++    } else {
++        ngx_gettimeofday(&tv);
++        ms = (tv.tv_sec - r->start_body_sec) * 1000
++                 + (tv.tv_usec / 1000 - r->start_body_msec);
++    }
++
++    ms = ngx_max(ms, 0);
++    r->recv_body_msec = ms;
++
++    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
++                   "read client request body recv_body_msec %d", r->recv_body_msec);
++
+     if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+         r->main->count--;
+     }
+@@ -244,7 +269,12 @@
+ static void
+ ngx_http_read_client_request_body_handler(ngx_http_request_t *r)
+ {
+-    ngx_int_t  rc;
++    ngx_int_t                  rc;
++    struct timeval             tv;
++    ngx_time_t                *tp;
++    ngx_msec_int_t             ms;
++    ngx_http_core_loc_conf_t  *clcf;
++
+ 
+     if (r->connection->read->timedout) {
+         r->connection->timedout = 1;
+@@ -254,6 +284,23 @@
+ 
+     rc = ngx_http_do_read_client_request_body(r);
+ 
++    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
++    if (clcf->request_time_cache) {
++        tp = ngx_timeofday();
++        ms = (ngx_msec_int_t)
++                 ((tp->sec - r->start_body_sec) * 1000 + (tp->msec - r->start_body_msec));
++    } else {
++        ngx_gettimeofday(&tv);
++        ms = (tv.tv_sec - r->start_body_sec) * 1000
++                 + (tv.tv_usec / 1000 - r->start_body_msec);
++    }
++
++    ms = ngx_max(ms, 0);
++    r->recv_body_msec = ms;
++
++    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
++                   "client request body handler recv_body_msec %d", r->recv_body_msec);
++
+     if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+         ngx_http_finalize_request(r, rc);
+     }
+diff -uNr tengine-2.1.0/src/http/ngx_http_request.c tengine-2.1.0_news/src/http/ngx_http_request.c
+--- tengine-2.1.0/src/http/ngx_http_request.c	2018-01-02 11:36:11.397001642 +0800
++++ tengine-2.1.0_news/src/http/ngx_http_request.c	2018-01-02 11:37:12.689001643 +0800
+@@ -706,6 +706,11 @@
+         r->start_usec = tv.tv_usec % 1000;
+     }
+ 
++    r->recv_header_msec = (NGX_ERROR) -1;
++    r->recv_body_msec = (NGX_ERROR) -1;
++    r->recv_module_msec = (NGX_ERROR) -1;
++
++
+     r->method = NGX_HTTP_UNKNOWN;
+     r->http_version = NGX_HTTP_VERSION_10;
+ 
+@@ -1327,10 +1332,14 @@
+     size_t                      len;
+     ssize_t                     n;
+     ngx_int_t                   rc, rv;
++    ngx_time_t                 *tp;
++    struct timeval             tv;
++    ngx_msec_int_t             ms;
+     ngx_table_elt_t            *h;
+     ngx_connection_t           *c;
+     ngx_http_header_t          *hh;
+     ngx_http_request_t         *r;
++    ngx_http_core_loc_conf_t   *clcf;
+     ngx_http_core_srv_conf_t   *cscf;
+     ngx_http_core_main_conf_t  *cmcf;
+ 
+@@ -1471,8 +1480,22 @@
+ 
+             /* a whole header has been parsed successfully */
+ 
+-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+-                           "http header done");
++            clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
++            if (clcf->request_time_cache) {
++                tp = ngx_timeofday();
++                ms = (ngx_msec_int_t)
++                         ((tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec));
++            } else {
++                ngx_gettimeofday(&tv);
++                ms = (tv.tv_sec - r->start_sec) * 1000
++                         + (tv.tv_usec / 1000 - r->start_msec);
++            }
++
++            ms = ngx_max(ms, 0);
++            r->recv_header_msec = ms;
++
++            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
++                           "http header done recv_header_msec %d", ms);
+ 
+             r->request_length += r->header_in->pos - r->header_name_start;
+ 
+diff -uNr tengine-2.1.0/src/http/ngx_http_request.h tengine-2.1.0_news/src/http/ngx_http_request.h
+--- tengine-2.1.0/src/http/ngx_http_request.h	2018-01-02 11:36:11.398001642 +0800
++++ tengine-2.1.0_news/src/http/ngx_http_request.h	2018-01-02 11:37:12.690001643 +0800
+@@ -408,6 +408,14 @@
+     ngx_msec_t                        start_msec;
+     ngx_usec_t                        start_usec;
+ 
++    time_t                            start_body_sec;
++    ngx_msec_t                        start_body_msec;
++    ngx_usec_t                        start_body_usec;
++
++    ngx_msec_int_t                    recv_header_msec;
++    ngx_msec_int_t                    recv_body_msec;
++    ngx_msec_int_t                    recv_module_msec;
++
+     ngx_uint_t                        method;
+     ngx_uint_t                        http_version;
+ 
+diff -uNr tengine-2.1.0/src/http/ngx_http_upstream.c tengine-2.1.0_news/src/http/ngx_http_upstream.c
+--- tengine-2.1.0/src/http/ngx_http_upstream.c	2018-01-02 11:36:11.433001642 +0800
++++ tengine-2.1.0_news/src/http/ngx_http_upstream.c	2018-01-02 11:37:07.219001642 +0800
+@@ -369,6 +369,18 @@
+       ngx_http_upstream_status_variable, 0,
+       NGX_HTTP_VAR_NOCACHEABLE, 0 },
+ 
++    { ngx_string("upstream_send_time"), NULL,
++      ngx_http_upstream_response_time_variable, 3,
++      NGX_HTTP_VAR_NOCACHEABLE, 0 },
++
++    { ngx_string("upstream_connect_time"), NULL,
++      ngx_http_upstream_response_time_variable, 2,
++      NGX_HTTP_VAR_NOCACHEABLE, 0 },
++
++    { ngx_string("upstream_process_time"), NULL,
++      ngx_http_upstream_response_time_variable, 1,
++      NGX_HTTP_VAR_NOCACHEABLE, 0 },
++
+     { ngx_string("upstream_response_time"), NULL,
+       ngx_http_upstream_response_time_variable, 0,
+       NGX_HTTP_VAR_NOCACHEABLE, 0 },
+@@ -463,11 +475,32 @@
+ void
+ ngx_http_upstream_init(ngx_http_request_t *r)
+ {
+-    ngx_connection_t     *c;
++    struct timeval              tv;
++    ngx_time_t                  *tp;
++    ngx_msec_int_t              ms;
++    ngx_connection_t            *c;
++    ngx_http_core_loc_conf_t    *clcf;
++
++    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
++    if (clcf->request_time_cache) {
++        tp = ngx_timeofday();
++        ms = (ngx_msec_int_t)
++                 ((tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec));
++    } else {
++        ngx_gettimeofday(&tv);
++        ms = (tv.tv_sec - r->start_sec) * 1000
++                 + (tv.tv_usec / 1000 - r->start_msec);
++    }
++
++    ms = ngx_max(ms, 0);
++    r->recv_module_msec = ms;
+ 
+     c = r->connection;
+ 
+     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
++                   "http init upstream, client recv_module_msec: %d", ms);
++
++    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                    "http init upstream, client timer: %d", c->read->timer_set);
+ 
+ #if (NGX_HTTP_SPDY)
+@@ -1306,6 +1339,12 @@
+     tp = ngx_timeofday();
+     u->state->response_sec = tp->sec;
+     u->state->response_msec = tp->msec;
++    u->state->connect_sec = (time_t) NGX_ERROR;
++    u->state->connect_msec = (time_t) NGX_ERROR;
++    u->state->process_sec = (time_t) NGX_ERROR;
++    u->state->process_msec = (time_t) NGX_ERROR;
++    u->state->send_sec = (time_t) NGX_ERROR;
++    u->state->send_msec = (time_t) NGX_ERROR;
+ 
+     rc = ngx_event_connect_peer(&u->peer);
+     if (rc == NGX_YIELD) {
+@@ -1592,6 +1631,7 @@
+ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u)
+ {
+     ngx_int_t          rc;
++    ngx_time_t        *tp;
+     ngx_connection_t  *c;
+ 
+     c = u->peer.connection;
+@@ -1599,6 +1639,12 @@
+     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                    "http upstream send request");
+ 
++    if (u->state->connect_sec ==  (time_t) NGX_ERROR) {
++        tp = ngx_timeofday();
++        u->state->connect_sec = tp->sec - u->state->response_sec;
++        u->state->connect_msec = tp->msec - u->state->response_msec;
++    }
++
+     if (!u->request_sent && ngx_http_upstream_test_connect(c) != NGX_OK) {
+         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+         return;
+@@ -1611,6 +1657,10 @@
+     u->request_sent = 1;
+ 
+     if (rc == NGX_ERROR) {
++        tp = ngx_timeofday();
++        u->state->send_sec = tp->sec - u->state->response_sec - u->state->connect_sec;
++        u->state->send_msec = tp->msec - u->state->response_msec - u->state->connect_msec;
++
+         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+         return;
+     }
+@@ -1620,6 +1670,10 @@
+     }
+ 
+     if (rc == NGX_AGAIN) {
++        tp = ngx_timeofday();
++        u->state->send_sec = tp->sec - u->state->response_sec - u->state->connect_sec;
++        u->state->send_msec = tp->msec - u->state->response_msec - u->state->connect_msec;
++
+         ngx_add_timer(c->write, u->conf->send_timeout);
+ 
+         if (ngx_handle_write_event(c->write, u->conf->send_lowat) != NGX_OK) {
+@@ -1632,6 +1686,9 @@
+     }
+ 
+     /* rc == NGX_OK */
++    tp = ngx_timeofday();
++    u->state->send_sec = tp->sec - u->state->response_sec - u->state->connect_sec;
++    u->state->send_msec = tp->msec - u->state->response_msec - u->state->connect_msec;
+ 
+     if (c->tcp_nopush == NGX_TCP_NOPUSH_SET) {
+         if (ngx_tcp_push(c->fd) == NGX_ERROR) {
+@@ -2017,6 +2074,7 @@
+ {
+     ssize_t            n;
+     ngx_int_t          rc;
++    ngx_time_t        *tp;
+     ngx_connection_t  *c;
+ 
+     c = u->peer.connection;
+@@ -2137,6 +2195,10 @@
+ 
+     /* rc == NGX_OK */
+ 
++    tp = ngx_timeofday();
++    u->state->process_sec = tp->sec - u->state->response_sec - u->state->connect_sec - u->state->send_sec;
++    u->state->process_msec = tp->msec - u->state->response_msec - u->state->connect_msec - u->state->send_msec;
++
+     if (u->headers_in.status_n >= NGX_HTTP_SPECIAL_RESPONSE) {
+ 
+         if (ngx_http_upstream_test_next(r, u) == NGX_OK) {
+@@ -4861,8 +4923,27 @@
+ 
+     for ( ;; ) {
+         if (state[i].status) {
+-            ms = (ngx_msec_int_t)
+-                     (state[i].response_sec * 1000 + state[i].response_msec);
++
++            //process_time
++            if (data == 1) {
++                ms = (ngx_msec_int_t)
++                    (state[i].process_sec * 1000 + state[i].process_msec);
++
++            //connect_time
++            } else if (data == 2 && state[i].connect_sec != (time_t) NGX_ERROR) {
++                ms = (ngx_msec_int_t)
++                        (state[i].connect_sec * 1000 + state[i].connect_msec);
++
++            //send_time
++            } else if (data == 3) {
++                ms = (ngx_msec_int_t) (state[i].send_sec * 1000 + state[i].send_msec);
++
++            //resonse_time
++            } else {
++                ms = (ngx_msec_int_t)
++                        (state[i].response_sec * 1000 + state[i].response_msec);
++            }
++
+             ms = ngx_max(ms, 0);
+             p = ngx_sprintf(p, "%T.%03M", (time_t) ms / 1000, ms % 1000);
+ 
+diff -uNr tengine-2.1.0/src/http/ngx_http_upstream.h tengine-2.1.0_news/src/http/ngx_http_upstream.h
+--- tengine-2.1.0/src/http/ngx_http_upstream.h	2018-01-02 11:36:11.396001642 +0800
++++ tengine-2.1.0_news/src/http/ngx_http_upstream.h	2018-01-02 11:40:54.494001638 +0800
+@@ -59,6 +59,16 @@
+     ngx_uint_t                       status;
+     time_t                           response_sec;
+     ngx_uint_t                       response_msec;
++
++    time_t                           process_sec;
++    ngx_uint_t                       process_msec;
++
++    time_t                           connect_sec;
++    ngx_uint_t                       connect_msec;
++
++    time_t                           send_sec;
++    ngx_uint_t                       send_msec;
++
+     off_t                            response_length;
+ 
+     ngx_str_t                       *peer;
